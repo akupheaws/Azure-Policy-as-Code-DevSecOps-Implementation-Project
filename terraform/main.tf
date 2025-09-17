@@ -53,18 +53,20 @@ resource "azurerm_network_security_group" "nsg" {
 ########################################
 locals {
   instances = {
-    vm01 = { name = "opa-az-vm-01", env = "dev",   size = "Standard_B1s" }
-    vm02 = { name = "opa-az-vm-02", env = "dev",   size = "Standard_B1s" }
-    vm03 = { name = "opa-az-vm-03", env = "qa",    size = "Standard_B1s" }
-    vm04 = { name = "opa-az-vm-04", env = "qa",    size = "Standard_B1s" }
+    vm01 = { name = "opa-az-vm-01", env = "dev",  size = "Standard_B1s" }
+    vm02 = { name = "opa-az-vm-02", env = "dev",  size = "Standard_B1s" }
+    vm03 = { name = "opa-az-vm-03", env = "qa",   size = "Standard_B1s" }
+    vm04 = { name = "opa-az-vm-04", env = "qa",   size = "Standard_B1s" }
     vm05 = { name = "opa-az-vm-05", env = "stage", size = "Standard_B1ms" }
     vm06 = { name = "opa-az-vm-06", env = "stage", size = "Standard_B1ms" }
-    vm07 = { name = "opa-az-vm-07", env = "prod",  size = "Standard_B2s" }
-    vm08 = { name = "opa-az-vm-08", env = "prod",  size = "Standard_B2s" }
+    vm07 = { name = "opa-az-vm-07", env = "prod", size = "Standard_B2s" }
+    vm08 = { name = "opa-az-vm-08", env = "prod", size = "Standard_B2s" }
   }
 }
 
+########################################
 # Public IPs (optional for demo)
+########################################
 resource "azurerm_public_ip" "pip" {
   for_each            = local.instances
   name                = "${each.value.name}-pip"
@@ -75,7 +77,9 @@ resource "azurerm_public_ip" "pip" {
   tags                = var.default_tags
 }
 
+########################################
 # NICs
+########################################
 resource "azurerm_network_interface" "nic" {
   for_each            = local.instances
   name                = "${each.value.name}-nic"
@@ -92,14 +96,18 @@ resource "azurerm_network_interface" "nic" {
   tags = var.default_tags
 }
 
+########################################
 # Associate NSG to NICs
+########################################
 resource "azurerm_network_interface_security_group_association" "nic_nsg" {
   for_each                  = local.instances
   network_interface_id      = azurerm_network_interface.nic[each.key].id
   network_security_group_id = azurerm_network_security_group.nsg.id
 }
 
+########################################
 # 8 Linux VMs
+########################################
 resource "azurerm_linux_virtual_machine" "vm" {
   for_each              = local.instances
   name                  = each.value.name
@@ -128,6 +136,9 @@ resource "azurerm_linux_virtual_machine" "vm" {
 
   tags = merge(
     var.default_tags,
-    { Name = each.value.name, Environment = each.value.env }
+    {
+      Name        = each.value.name
+      Environment = each.value.env
+    }
   )
 }

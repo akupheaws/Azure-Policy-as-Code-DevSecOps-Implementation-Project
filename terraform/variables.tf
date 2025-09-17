@@ -11,8 +11,8 @@ variable "resource_group_name" {
 }
 
 variable "admin_username" {
-  type        = string
-  default     = "azureuser"
+  type    = string
+  default = "azureuser"
 }
 
 variable "ssh_public_key" {
