@@ -9,7 +9,7 @@ SA="akuphetfstate1234"    # must be globally unique, lowercase
 CONTAINER="tfstate"
 # If you use a SP for GitHub Actions, set its app (client) id to grant Blob RBAC:
 GITHUB_SP_APP_ID="<optional-gh-sp-client-id>"   # e.g., from AZURE_CREDENTIALS.clientId
-# =========================
+# ========================
 
 az account set --subscription "$SUBSCRIPTION_ID"
 
