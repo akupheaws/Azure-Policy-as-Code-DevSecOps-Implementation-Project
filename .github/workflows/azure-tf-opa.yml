@@ -1,0 +1,162 @@
+name: Azure Terraform + OPA Compliance
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Run terraform apply (only on main)"
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: az-tf-opa-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.8.5"
+  TF_WORKDIR: "./terraform"
+  CONFTEST_VERSION: "v0.59.0"
+  # Backend (must be unique storage account name)
+  AZ_BACKEND_RG: "rg-tfstate"
+  AZ_BACKEND_LOCATION: "eastus"
+  AZ_BACKEND_SA: "akuphetfstate1234"   # <--- globally unique, lowercase
+  AZ_BACKEND_CONTAINER: "tfstate"
+  AZ_BACKEND_STATE_KEY: "azure-compliance/terraform.tfstate"
+
+jobs:
+  backend_setup:
+    name: Backend Setup (RG + Storage)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Ensure RG/Storage/Container
+        shell: bash
+        run: |
+          set -euo pipefail
+          az group create -n "$AZ_BACKEND_RG" -l "$AZ_BACKEND_LOCATION" 1>/dev/null
+          # Storage account must be unique; choose name carefully
+          if ! az storage account show -n "$AZ_BACKEND_SA" -g "$AZ_BACKEND_RG" 1>/dev/null 2>&1; then
+            az storage account create -n "$AZ_BACKEND_SA" -g "$AZ_BACKEND_RG" -l "$AZ_BACKEND_LOCATION" --sku Standard_LRS --encryption-services blob 1>/dev/null
+          fi
+          az storage container create --name "$AZ_BACKEND_CONTAINER" --account-name "$AZ_BACKEND_SA" 1>/dev/null
+          echo "Backend ready."
+
+  fmt:
+    name: Terraform Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Terraform Format (auto-fix on PR)
+        if: ${{ github.event_name == 'pull_request' }}
+        working-directory: ${{ env.TF_WORKDIR }}
+        run: terraform fmt -recursive
+      - name: Commit formatted files (PR only)
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: terraform fmt"
+          file_pattern: |
+            **/*.tf
+            **/*.tfvars
+      - name: Terraform Format Check
+        working-directory: ${{ env.TF_WORKDIR }}
+        run: terraform fmt -recursive -check -diff
+
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: [backend_setup, fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKDIR }}
+        run: terraform init -input=false -upgrade
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_WORKDIR }}
+        run: terraform validate
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_WORKDIR }}
+        run: terraform plan -out plan.out
+      - name: Export plan.json
+        working-directory: ${{ env.TF_WORKDIR }}
+        run: terraform show -json plan.out > plan.json
+      - name: Upload plan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-plan-and-policy-artifacts
+          path: |
+            ${{ env.TF_WORKDIR }}/plan.out
+            ${{ env.TF_WORKDIR }}/plan.json
+          retention-days: 7
+
+  policy_and_apply:
+    name: OPA Policy Check (+ optional Apply)
+    runs-on: ubuntu-latest
+    needs: [plan]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Download plan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: tf-plan-and-policy-artifacts
+          path: ${{ env.TF_WORKDIR }}
+
+      # Conftest pinned installer
+      - name: Install Conftest
+        shell: bash
+        run: |
+          set -euo pipefail
+          OS="Linux"
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64|amd64) ARCH="x86_64" ;;
+            aarch64|arm64) ARCH="arm64" ;;
+            *) echo "Unsupported arch: $ARCH"; exit 1 ;;
+          esac
+          VER="${CONFTEST_VERSION#v}"
+          ASSET="conftest_${VER}_${OS}_${ARCH}.tar.gz"
+          URL="https://github.com/open-policy-agent/conftest/releases/download/${CONFTEST_VERSION}/${ASSET}"
+          curl -sSLf -o /tmp/conftest.tgz "$URL"
+          tar -xzf /tmp/conftest.tgz -C /tmp
+          sudo mv /tmp/conftest /usr/local/bin/conftest
+          conftest --version
+
+      - name: OPA Policy Check (Conftest)
+        run: conftest test ${{ env.TF_WORKDIR }}/plan.json --policy policies/tfplan
+
+      # Gated apply (manual trigger on main)
+      - name: Terraform Init (for apply)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.apply == 'true' }}
+        working-directory: ${{ env.TF_WORKDIR }}
+        run: terraform init -input=false
+      - name: Terraform Apply (gated)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.apply == 'true' }}
+        working-directory: ${{ env.TF_WORKDIR }}
+        run: terraform apply -auto-approve plan.out
