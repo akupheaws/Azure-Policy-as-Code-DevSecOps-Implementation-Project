@@ -12,6 +12,10 @@ on:
         default: "false"
         type: choice
         options: ["false", "true"]
+      lock_id:
+        description: "Terraform state lock ID to force-unlock (optional)"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -23,7 +27,9 @@ concurrency:
 env:
   TF_VERSION: "1.8.5"
   TF_WORKDIR: "./terraform"
+  # Pin Conftest before the v0.60+ Rego v1 default
   CONFTEST_VERSION: "v0.59.0"
+
   # Backend identifiers (used by backend_setup)
   AZ_BACKEND_RG: "rg-tfstate"
   AZ_BACKEND_LOCATION: "eastus"
@@ -43,9 +49,6 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Who am I?
-        run: az account show --query "{name:name,id:id}" -o tsv
-
       - name: Ensure RG/Storage/Container and grant Blob RBAC
         shell: bash
         env:
@@ -53,32 +56,36 @@ jobs:
         run: |
           set -euo pipefail
 
+          echo ">>> Ensure resource group"
           az group create -n "$AZ_BACKEND_RG" -l "$AZ_BACKEND_LOCATION" 1>/dev/null
 
+          echo ">>> Ensure storage account"
           if ! az storage account show -n "$AZ_BACKEND_SA" -g "$AZ_BACKEND_RG" 1>/dev/null 2>&1; then
             az storage account create \
               -n "$AZ_BACKEND_SA" -g "$AZ_BACKEND_RG" -l "$AZ_BACKEND_LOCATION" \
               --sku Standard_LRS --encryption-services blob --min-tls-version TLS1_2 1>/dev/null
           fi
 
+          echo ">>> Enable blob versioning"
           az storage account blob-service-properties update \
             --account-name "$AZ_BACKEND_SA" --resource-group "$AZ_BACKEND_RG" \
             --enable-versioning true 1>/dev/null
 
+          echo ">>> Ensure private container"
           az storage container create \
             --name "$AZ_BACKEND_CONTAINER" \
             --account-name "$AZ_BACKEND_SA" \
             --auth-mode login \
             --public-access off 1>/dev/null || true
 
+          echo ">>> Grant 'Storage Blob Data Contributor' to SP on storage account"
           SA_ID=$(az storage account show -n "$AZ_BACKEND_SA" -g "$AZ_BACKEND_RG" --query id -o tsv)
-          # Idempotent: ignore if already exists
           az role assignment create \
             --assignee "$APP_ID" \
             --role "Storage Blob Data Contributor" \
             --scope "$SA_ID" 1>/dev/null || true
 
-          echo "Waiting for RBAC propagation..."
+          echo ">>> Wait for RBAC propagation & test data-plane access..."
           for i in {1..60}; do
             if az storage blob list --account-name "$AZ_BACKEND_SA" -c "$AZ_BACKEND_CONTAINER" --auth-mode login --num-results 1 >/dev/null 2>&1; then
               echo "Data-plane access OK."
@@ -92,6 +99,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
@@ -116,6 +124,28 @@ jobs:
         working-directory: ${{ env.TF_WORKDIR }}
         run: terraform fmt -recursive -check -diff
 
+  unlock_state:
+    name: Force Unlock State (manual)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.lock_id != '' }}
+    env:
+      ARM_CLIENT_ID:       ${{ fromJSON(secrets.AZURE_CREDENTIALS).clientId }}
+      ARM_CLIENT_SECRET:   ${{ fromJSON(secrets.AZURE_CREDENTIALS).clientSecret }}
+      ARM_TENANT_ID:       ${{ fromJSON(secrets.AZURE_CREDENTIALS).tenantId }}
+      ARM_SUBSCRIPTION_ID: ${{ fromJSON(secrets.AZURE_CREDENTIALS).subscriptionId }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Azure Login (CLI)
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Force unlock (ensure no other run is active)
+        working-directory: ${{ env.TF_WORKDIR }}
+        run: terraform force-unlock -force "${{ inputs.lock_id }}"
+
   plan:
     name: Terraform Plan
     runs-on: ubuntu-latest
@@ -126,9 +156,9 @@ jobs:
       ARM_CLIENT_SECRET:   ${{ fromJSON(secrets.AZURE_CREDENTIALS).clientSecret }}
       ARM_TENANT_ID:       ${{ fromJSON(secrets.AZURE_CREDENTIALS).tenantId }}
       ARM_SUBSCRIPTION_ID: ${{ fromJSON(secrets.AZURE_CREDENTIALS).subscriptionId }}
-      # >>> Fix: provide ssh_public_key so TF doesn't prompt
+      # Provide required input so TF won't prompt
       TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
-      # Optional: if you want to restrict SSH in NSG via env instead of default
+      # Optionally restrict SSH via var instead of default
       # TF_VAR_allowed_ssh_cidr: ${{ vars.ALLOWED_SSH_CIDR }}
     steps:
       - uses: actions/checkout@v4
@@ -137,9 +167,6 @@ jobs:
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      - name: Who am I?
-        run: az account show --query "{name:name,id:id}" -o tsv
 
       - uses: hashicorp/setup-terraform@v3
         with:
@@ -153,9 +180,9 @@ jobs:
         working-directory: ${{ env.TF_WORKDIR }}
         run: terraform validate
 
-      - name: Terraform Plan
+      - name: Terraform Plan (wait for lock up to 5m)
         working-directory: ${{ env.TF_WORKDIR }}
-        run: terraform plan -out plan.out
+        run: terraform plan -lock-timeout=5m -out plan.out
 
       - name: Export plan.json
         working-directory: ${{ env.TF_WORKDIR }}
@@ -180,7 +207,6 @@ jobs:
       ARM_CLIENT_SECRET:   ${{ fromJSON(secrets.AZURE_CREDENTIALS).clientSecret }}
       ARM_TENANT_ID:       ${{ fromJSON(secrets.AZURE_CREDENTIALS).tenantId }}
       ARM_SUBSCRIPTION_ID: ${{ fromJSON(secrets.AZURE_CREDENTIALS).subscriptionId }}
-      # Keep TF vars available for any init/apply here too
       TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
       # TF_VAR_allowed_ssh_cidr: ${{ vars.ALLOWED_SSH_CIDR }}
     steps:
@@ -229,7 +255,7 @@ jobs:
         working-directory: ${{ env.TF_WORKDIR }}
         run: terraform init -input=false
 
-      - name: Terraform Apply (gated)
+      - name: Terraform Apply (wait for lock up to 5m)
         if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.apply == 'true' }}
         working-directory: ${{ env.TF_WORKDIR }}
-        run: terraform apply -auto-approve plan.out
+        run: terraform apply -lock-timeout=5m -auto-approve plan.out
