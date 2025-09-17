@@ -26,7 +26,6 @@ variable "allowed_ssh_cidr" {
   default     = "0.0.0.0/0"
 }
 
-# Default, compliant tags (OPA enforces presence/values)
 variable "default_tags" {
   type = map(string)
   default = {

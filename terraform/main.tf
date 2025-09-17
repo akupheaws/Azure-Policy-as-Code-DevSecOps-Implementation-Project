@@ -53,10 +53,10 @@ resource "azurerm_network_security_group" "nsg" {
 ########################################
 locals {
   instances = {
-    vm01 = { name = "opa-az-vm-01", env = "dev",  size = "Standard_B1s" }
-    vm02 = { name = "opa-az-vm-02", env = "dev",  size = "Standard_B1s" }
-    vm03 = { name = "opa-az-vm-03", env = "qa",   size = "Standard_B1s" }
-    vm04 = { name = "opa-az-vm-04", env = "qa",   size = "Standard_B1s" }
+    vm01 = { name = "opa-az-vm-01", env = "dev", size = "Standard_B1s" }
+    vm02 = { name = "opa-az-vm-02", env = "dev", size = "Standard_B1s" }
+    vm03 = { name = "opa-az-vm-03", env = "qa",  size = "Standard_B1s" }
+    vm04 = { name = "opa-az-vm-04", env = "qa",  size = "Standard_B1s" }
     vm05 = { name = "opa-az-vm-05", env = "stage", size = "Standard_B1ms" }
     vm06 = { name = "opa-az-vm-06", env = "stage", size = "Standard_B1ms" }
     vm07 = { name = "opa-az-vm-07", env = "prod", size = "Standard_B2s" }
