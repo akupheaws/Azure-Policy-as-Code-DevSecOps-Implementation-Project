@@ -33,7 +33,7 @@ env:
 
 jobs:
   backend_setup:
-    name: Backend Setup (RG + Storage)
+    name: Backend Setup (RG + Storage + RBAC)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -46,34 +46,57 @@ jobs:
       - name: Who am I?
         run: az account show --query "{name:name,id:id}" -o tsv
 
-      - name: Ensure RG/Storage/Container
+      - name: Ensure RG/Storage/Container and grant Blob RBAC
         shell: bash
+        env:
+          APP_ID: ${{ fromJSON(secrets.AZURE_CREDENTIALS).clientId }}
         run: |
           set -euo pipefail
+
+          echo ">>> Ensure resource group"
           az group create -n "$AZ_BACKEND_RG" -l "$AZ_BACKEND_LOCATION" 1>/dev/null
 
+          echo ">>> Ensure storage account (must be globally unique)"
           if ! az storage account show -n "$AZ_BACKEND_SA" -g "$AZ_BACKEND_RG" 1>/dev/null 2>&1; then
             az storage account create \
               -n "$AZ_BACKEND_SA" -g "$AZ_BACKEND_RG" -l "$AZ_BACKEND_LOCATION" \
               --sku Standard_LRS --encryption-services blob --min-tls-version TLS1_2 1>/dev/null
           fi
 
+          echo ">>> Enable blob versioning"
           az storage account blob-service-properties update \
             --account-name "$AZ_BACKEND_SA" --resource-group "$AZ_BACKEND_RG" \
             --enable-versioning true 1>/dev/null
 
+          echo ">>> Ensure private container"
           az storage container create \
             --name "$AZ_BACKEND_CONTAINER" \
             --account-name "$AZ_BACKEND_SA" \
             --auth-mode login \
-            --public-access off 1>/dev/null
+            --public-access off 1>/dev/null || true
+
+          echo ">>> Grant 'Storage Blob Data Contributor' to SP on storage account"
+          SA_ID=$(az storage account show -n "$AZ_BACKEND_SA" -g "$AZ_BACKEND_RG" --query id -o tsv)
+          # Idempotent: ignore if already exists
+          az role assignment create \
+            --assignee "$APP_ID" \
+            --role "Storage Blob Data Contributor" \
+            --scope "$SA_ID" 1>/dev/null || true
+
+          echo ">>> Wait for RBAC propagation (up to ~2min)"
+          for i in {1..24}; do
+            if az storage container list --account-name "$AZ_BACKEND_SA" --auth-mode login 1>/dev/null 2>&1; then
+              echo "RBAC ready."
+              break
+            fi
+            echo "RBAC not active yet... retry $i/24"; sleep 5
+          done
 
   fmt:
     name: Terraform Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
